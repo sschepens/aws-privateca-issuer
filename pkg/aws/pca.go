@@ -33,6 +33,9 @@ import (
 	injections "github.com/cert-manager/aws-privateca-issuer/pkg/api/injections"
 	"github.com/go-logr/logr"
 	cmapi "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
+	experimentalapi "github.com/jetstack/cert-manager/pkg/apis/experimental/v1alpha1"
+	certificatesv1 "k8s.io/api/certificates/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -43,6 +46,7 @@ var collection = new(sync.Map)
 // GenericProvisioner abstracts over the Provisioner type for mocking purposes
 type GenericProvisioner interface {
 	Sign(ctx context.Context, cr *cmapi.CertificateRequest, log logr.Logger) ([]byte, []byte, error)
+	SignCSR(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, log logr.Logger) ([]byte, []byte, error)
 }
 
 // acmPCAClient abstracts over the methods used from acmpca.Client
@@ -88,8 +92,8 @@ func NewProvisioner(config aws.Config, arn string) (p *PCAProvisioner) {
 
 // idempotencyToken is limited to 64 ASCII characters, so make a fixed length hash.
 // @see: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Run_Instance_Idempotency.html
-func idempotencyToken(cr *cmapi.CertificateRequest) string {
-	token := []byte(cr.ObjectMeta.Namespace + "/" + cr.ObjectMeta.Name)
+func idempotencyToken(meta *v1.ObjectMeta) string {
+	token := []byte(meta.Namespace + "/" + meta.Name)
 	return fmt.Sprintf("%x", md5.Sum(token))
 }
 
@@ -108,7 +112,7 @@ func (p *PCAProvisioner) Sign(ctx context.Context, cr *cmapi.CertificateRequest,
 	tempArn := templateArn(p.arn, cr.Spec)
 
 	// Consider it a "retry" if we try to re-create a cert with the same name in the same namespace
-	token := idempotencyToken(cr)
+	token := idempotencyToken(&cr.ObjectMeta)
 
 	err := getSigningAlgorithm(ctx, p)
 	if err != nil {
@@ -120,6 +124,78 @@ func (p *PCAProvisioner) Sign(ctx context.Context, cr *cmapi.CertificateRequest,
 		SigningAlgorithm:        *p.signingAlgorithm,
 		TemplateArn:             aws.String(tempArn),
 		Csr:                     cr.Spec.Request,
+		Validity: &acmpcatypes.Validity{
+			Type:  acmpcatypes.ValidityPeriodTypeAbsolute,
+			Value: &validityExpiration,
+		},
+		IdempotencyToken: aws.String(token),
+	}
+
+	issueOutput, err := p.pcaClient.IssueCertificate(ctx, &issueParams)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	getParams := acmpca.GetCertificateInput{
+		CertificateArn:          aws.String(*issueOutput.CertificateArn),
+		CertificateAuthorityArn: aws.String(p.arn),
+	}
+
+	log.Info("Created certificate with arn: " + *issueOutput.CertificateArn)
+
+	waiter := acmpca.NewCertificateIssuedWaiter(p.pcaClient)
+	err = waiter.Wait(ctx, &getParams, 5*time.Minute)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	getOutput, err := p.pcaClient.GetCertificate(ctx, &getParams)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certPem := []byte(*getOutput.Certificate + "\n")
+	chainPem := []byte(*getOutput.CertificateChain)
+	chainIntCAs, rootCA, err := splitRootCACertificate(chainPem)
+	if err != nil {
+		return nil, nil, err
+	}
+	certPem = append(certPem, chainIntCAs...)
+
+	return certPem, rootCA, nil
+}
+
+// SignCSR takes a certificate signing request and signs it using PCA
+func (p *PCAProvisioner) SignCSR(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, log logr.Logger) ([]byte, []byte, error) {
+	now := p.now()
+	validityExpiration := p.now().Add(DEFAULT_DURATION * time.Second).Unix()
+	requestedDuration, ok := csr.Annotations[experimentalapi.CertificateSigningRequestDurationAnnotationKey]
+	if ok {
+		duration, err := time.ParseDuration(requestedDuration)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse requested duration on annotation %q: %w",
+				experimentalapi.CertificateSigningRequestDurationAnnotationKey, err)
+		}
+
+		validityExpiration = now.Add(duration).Unix()
+	}
+
+	tempArn := templateArnCSR(p.arn, csr)
+
+	// Consider it a "retry" if we try to re-create a cert with the same name in the same namespace
+	token := idempotencyToken(&csr.ObjectMeta)
+
+	err := getSigningAlgorithm(ctx, p)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	issueParams := acmpca.IssueCertificateInput{
+		CertificateAuthorityArn: aws.String(p.arn),
+		SigningAlgorithm:        *p.signingAlgorithm,
+		TemplateArn:             aws.String(tempArn),
+		Csr:                     csr.Spec.Request,
 		Validity: &acmpcatypes.Validity{
 			Type:  acmpcatypes.ValidityPeriodTypeAbsolute,
 			Value: &validityExpiration,
@@ -210,6 +286,37 @@ func templateArn(caArn string, spec cmapi.CertificateRequestSpec) string {
 	} else if len(spec.Usages) == 2 {
 		clientServer := (spec.Usages[0] == cmapi.UsageClientAuth && spec.Usages[1] == cmapi.UsageServerAuth)
 		serverClient := (spec.Usages[0] == cmapi.UsageServerAuth && spec.Usages[1] == cmapi.UsageClientAuth)
+		if clientServer || serverClient {
+			return prefix + "acm-pca:::template/EndEntityCertificate/V1"
+		}
+	}
+
+	return prefix + "acm-pca:::template/BlankEndEntityCertificate_APICSRPassthrough/V1"
+}
+
+func templateArnCSR(caArn string, csr *certificatesv1.CertificateSigningRequest) string {
+	arn := strings.SplitAfterN(caArn, ":", 3)
+	prefix := arn[0] + arn[1]
+
+	isCA := csr.Annotations[experimentalapi.CertificateSigningRequestIsCAAnnotationKey]
+	if isCA == "true" {
+		return prefix + "acm-pca:::template/SubordinateCACertificate_PathLen0/V1"
+	}
+
+	if len(csr.Spec.Usages) == 1 {
+		switch csr.Spec.Usages[0] {
+		case certificatesv1.UsageCodeSigning:
+			return prefix + "acm-pca:::template/CodeSigningCertificate/V1"
+		case certificatesv1.UsageClientAuth:
+			return prefix + "acm-pca:::template/EndEntityClientAuthCertificate/V1"
+		case certificatesv1.UsageServerAuth:
+			return prefix + "acm-pca:::template/EndEntityServerAuthCertificate/V1"
+		case certificatesv1.UsageOCSPSigning:
+			return prefix + "acm-pca:::template/OCSPSigningCertificate/V1"
+		}
+	} else if len(csr.Spec.Usages) == 2 {
+		clientServer := (csr.Spec.Usages[0] == certificatesv1.UsageClientAuth && csr.Spec.Usages[1] == certificatesv1.UsageServerAuth)
+		serverClient := (csr.Spec.Usages[0] == certificatesv1.UsageServerAuth && csr.Spec.Usages[1] == certificatesv1.UsageClientAuth)
 		if clientServer || serverClient {
 			return prefix + "acm-pca:::template/EndEntityCertificate/V1"
 		}

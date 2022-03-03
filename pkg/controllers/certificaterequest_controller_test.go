@@ -26,6 +26,7 @@ import (
 	cmgen "github.com/jetstack/cert-manager/test/unit/gen"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +49,10 @@ type fakeProvisioner struct {
 }
 
 func (p *fakeProvisioner) Sign(ctx context.Context, cr *cmapi.CertificateRequest, log logr.Logger) ([]byte, []byte, error) {
+	return p.cert, p.caCert, p.err
+}
+
+func (p *fakeProvisioner) SignCSR(ctx context.Context, csr *certificatesv1.CertificateSigningRequest, log logr.Logger) ([]byte, []byte, error) {
 	return p.cert, p.caCert, p.err
 }
 

@@ -112,15 +112,24 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controllers.CertificateRequestReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("awspcaissuer-controller"),
-
+		Client:                 mgr.GetClient(),
+		Log:                    ctrl.Log.WithName("controllers").WithName("CertificateRequest"),
+		Scheme:                 mgr.GetScheme(),
+		Recorder:               mgr.GetEventRecorderFor("awspcaissuer-controller"),
 		Clock:                  clock.RealClock{},
 		CheckApprovedCondition: !disableApprovedCheck,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertificateRequest")
+		os.Exit(1)
+	}
+	if err = (&controllers.CertificateSigningRequestReconciler{
+		Client:   mgr.GetClient(),
+		Log:      ctrl.Log.WithName("controllers").WithName("CertificateSigningRequest"),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("awspcaissuer-controller"),
+		Clock:    clock.RealClock{},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "CertificateSigningRequest")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

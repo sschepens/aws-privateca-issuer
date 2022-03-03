@@ -18,6 +18,8 @@ package util
 
 import (
 	"context"
+	"fmt"
+
 	api "github.com/cert-manager/aws-privateca-issuer/pkg/api/v1beta1"
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +46,22 @@ func GetIssuer(ctx context.Context, client client.Client, name types.NamespacedN
 		return ciss, nil
 	}
 	return iss, nil
+}
+
+// GetGenericIssuer returns either an AWSPCAClusterIssuer or AWSPCAIssuer by its name and kind
+func GetGenericIssuer(ctx context.Context, client client.Client, name types.NamespacedName, kind string) (api.GenericIssuer, error) {
+	switch kind {
+	case "", "AWSPCAIssuer":
+		iss := new(api.AWSPCAIssuer)
+		err := client.Get(ctx, name, iss)
+		return iss, err
+	case "AWSPCAClusterIssuer":
+		ciss := new(api.AWSPCAClusterIssuer)
+		err := client.Get(ctx, name, ciss)
+		return ciss, err
+	default:
+		return nil, fmt.Errorf(`invalid value %q for issuerRef.kind. Must be empty, AWSPCAIssuer or AWSPCAClusterIssuer`, kind)
+	}
 }
 
 // SetIssuerCondition sets the ready state of an issuer and updates it in the cluster

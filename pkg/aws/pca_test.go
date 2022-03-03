@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	certificatesv1 "k8s.io/api/certificates/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,6 +36,7 @@ import (
 	"github.com/go-logr/logr"
 
 	v1 "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
+	experimentalapi "github.com/jetstack/cert-manager/pkg/apis/experimental/v1alpha1"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -301,6 +303,130 @@ func TestPCATemplateArn(t *testing.T) {
 	}
 }
 
+func TestPCATemplateArnCSR(t *testing.T) {
+	var (
+		arn     = "arn:aws:acm-pca:us-east-1:account:certificate-authority/12345678-1234-1234-1234-123456789012"
+		govArn  = "arn:aws-us-gov:acm-pca:us-east-1:account:certificate-authority/12345678-1234-1234-1234-123456789012"
+		fakeArn = "arn:fake:acm-pca:us-east-1:account:certificate-authority/12345678-1234-1234-1234-123456789012"
+	)
+
+	type testCase struct {
+		expectedSuffix string
+		csr            certificatesv1.CertificateSigningRequest
+	}
+	tests := map[string]testCase{
+		"client": {
+			expectedSuffix: ":acm-pca:::template/EndEntityClientAuthCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageClientAuth,
+					},
+				},
+			},
+		},
+		"server": {
+			expectedSuffix: ":acm-pca:::template/EndEntityServerAuthCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageServerAuth,
+					},
+				},
+			},
+		},
+		"client server": {
+			expectedSuffix: ":acm-pca:::template/EndEntityCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageClientAuth,
+						certificatesv1.UsageServerAuth,
+					},
+				},
+			},
+		},
+		"server client": {
+			expectedSuffix: ":acm-pca:::template/EndEntityCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageServerAuth,
+						certificatesv1.UsageClientAuth,
+					},
+				},
+			},
+		},
+		"code signing": {
+			expectedSuffix: ":acm-pca:::template/CodeSigningCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageCodeSigning,
+					},
+				},
+			},
+		},
+		"ocsp signing": {
+			expectedSuffix: ":acm-pca:::template/OCSPSigningCertificate/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageOCSPSigning,
+					},
+				},
+			},
+		},
+		"other": {
+			expectedSuffix: ":acm-pca:::template/BlankEndEntityCertificate_APICSRPassthrough/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Usages: []certificatesv1.KeyUsage{
+						certificatesv1.UsageTimestamping,
+					},
+				},
+			},
+		},
+		"isCA default": {
+			expectedSuffix: ":acm-pca:::template/SubordinateCACertificate_PathLen0/V1",
+			csr: certificatesv1.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						experimentalapi.CertificateSigningRequestIsCAAnnotationKey: "true",
+					},
+				},
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			csr := tc.csr
+
+			response := templateArnCSR(arn, &csr)
+			assert.True(t, strings.HasSuffix(response, tc.expectedSuffix), "returns expected template")
+			assert.True(t, strings.HasPrefix(response, "arn:aws:"), "returns expected ARN prefix")
+		})
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			csr := tc.csr
+
+			response := templateArnCSR(govArn, &csr)
+			assert.True(t, strings.HasSuffix(response, tc.expectedSuffix), "us-gov returns expected template")
+			assert.True(t, strings.HasPrefix(response, "arn:aws-us-gov:"), "us-gov returns expected ARN prefix")
+		})
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			csr := tc.csr
+
+			response := templateArnCSR(fakeArn, &csr)
+			assert.True(t, strings.HasSuffix(response, tc.expectedSuffix), "fake arn returns expected template")
+			assert.True(t, strings.HasPrefix(response, "arn:fake:"), "fake arn returns expected ARN prefix")
+		})
+	}
+}
+
 func TestIdempotencyToken(t *testing.T) {
 	var (
 		idempotencyTokenMaxLength = 36
@@ -325,7 +451,37 @@ func TestIdempotencyToken(t *testing.T) {
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			token := idempotencyToken(&tc.request)
+			token := idempotencyToken(&tc.request.ObjectMeta)
+			assert.Equal(t, tc.expected, token)
+			assert.LessOrEqual(t, len(token), idempotencyTokenMaxLength)
+		})
+	}
+}
+
+func TestIdempotencyTokenCSR(t *testing.T) {
+	var (
+		idempotencyTokenMaxLength = 36
+	)
+
+	type testCase struct {
+		request  certificatesv1.CertificateSigningRequest
+		expected string
+	}
+
+	tests := map[string]testCase{
+		"success": {
+			request: certificatesv1.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "fake-name",
+				},
+			},
+			expected: "0227d545f43bdce05ad9dd5637ec567a",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			token := idempotencyToken(&tc.request.ObjectMeta)
 			assert.Equal(t, tc.expected, token)
 			assert.LessOrEqual(t, len(token), idempotencyTokenMaxLength)
 		})
@@ -368,6 +524,55 @@ func TestPCASign(t *testing.T) {
 			}
 
 			leaf, chain, err := tc.provisioner.Sign(context.TODO(), cr, logr.Discard())
+			if tc.expectFailure && err == nil {
+				fmt.Print(err.Error())
+				assert.Fail(t, "Expected an error but received none")
+			}
+
+			if tc.expectedChain != "" && tc.expectedCert != "" {
+				assert.Equal(t, []byte(tc.expectedCert), leaf)
+				assert.Equal(t, []byte(tc.expectedChain), chain)
+			}
+		})
+	}
+}
+
+func TestPCASignCSR(t *testing.T) {
+	type testCase struct {
+		provisioner   PCAProvisioner
+		expectFailure bool
+		expectedChain string
+		expectedCert  string
+	}
+
+	tests := map[string]testCase{
+		"success": {
+			provisioner:   PCAProvisioner{arn: arn, pcaClient: &workingACMPCAClient{}},
+			expectFailure: false,
+			expectedChain: string([]byte(root + "\n")),
+			expectedCert:  string([]byte(cert + "\n" + intermediate + "\n")),
+		},
+		"failure-error-issueCertificate": {
+			provisioner:   PCAProvisioner{arn: arn, pcaClient: &errorACMPCAClient{}},
+			expectFailure: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			key, _ := rsa.GenerateKey(rand.Reader, 2048)
+			csrBytes, _ := x509.CreateCertificateRequest(rand.Reader, &template, key)
+
+			csr := &certificatesv1.CertificateSigningRequest{
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Request: pem.EncodeToMemory(&pem.Block{
+						Bytes: csrBytes,
+						Type:  "CERTIFICATE REQUEST",
+					}),
+				},
+			}
+
+			leaf, chain, err := tc.provisioner.SignCSR(context.TODO(), csr, logr.Discard())
 			if tc.expectFailure && err == nil {
 				fmt.Print(err.Error())
 				assert.Fail(t, "Expected an error but received none")
@@ -431,6 +636,78 @@ func TestPCASignValidity(t *testing.T) {
 			}
 
 			_, _, _ = provisioner.Sign(context.TODO(), cr, logr.Discard())
+			got := client.issueCertInput
+			if got == nil {
+				assert.Fail(t, "Expected certificate input, got none")
+			} else {
+				assert.Equal(t, *got.CertificateAuthorityArn, *tc.expectedInput.CertificateAuthorityArn, name)
+				assert.Equal(t, got.Validity.Type, tc.expectedInput.Validity.Type, name)
+				assert.Equal(t, *got.Validity.Value, *tc.expectedInput.Validity.Value, name)
+			}
+
+		})
+	}
+}
+
+func TestPCASignCSRValidity(t *testing.T) {
+	now := time.Now()
+	client := &workingACMPCAClient{}
+	provisioner := PCAProvisioner{arn: arn, pcaClient: client}
+	provisioner.clock = func() time.Time { return now }
+	type testCase struct {
+		duration      *metav1.Duration
+		expectedInput *acmpca.IssueCertificateInput
+	}
+
+	tests := map[string]testCase{
+		"default": {
+			duration: nil,
+			expectedInput: &acmpca.IssueCertificateInput{
+				CertificateAuthorityArn: aws.String(arn),
+				Validity: &acmpcatypes.Validity{
+					Type:  acmpcatypes.ValidityPeriodTypeAbsolute,
+					Value: ptrInt(int64(now.Unix()) + DEFAULT_DURATION),
+				},
+			},
+		},
+		"duration specified": {
+			duration: ptrDuration(metav1.Duration{Duration: 3 * time.Hour}),
+			expectedInput: &acmpca.IssueCertificateInput{
+				CertificateAuthorityArn: aws.String(arn),
+				Validity: &acmpcatypes.Validity{
+					Type:  acmpcatypes.ValidityPeriodTypeAbsolute,
+					Value: ptrInt(int64(now.Unix()) + int64(3*time.Hour.Seconds())),
+				},
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			client.issueCertInput = nil
+			key, _ := rsa.GenerateKey(rand.Reader, 2048)
+			csrBytes, _ := x509.CreateCertificateRequest(rand.Reader, &template, key)
+
+			annotations := make(map[string]string)
+
+			if tc.duration != nil {
+				annotations[experimentalapi.CertificateSigningRequestDurationAnnotationKey] = tc.duration.Duration.String()
+			}
+
+			csr := &certificatesv1.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: annotations,
+				},
+				Spec: certificatesv1.CertificateSigningRequestSpec{
+					Request: pem.EncodeToMemory(&pem.Block{
+						Bytes: csrBytes,
+						Type:  "CERTIFICATE REQUEST",
+					}),
+				},
+			}
+
+			_, _, err := provisioner.SignCSR(context.TODO(), csr, logr.Discard())
+			fmt.Printf("error signing: %s\n", err)
 			got := client.issueCertInput
 			if got == nil {
 				assert.Fail(t, "Expected certificate input, got none")
